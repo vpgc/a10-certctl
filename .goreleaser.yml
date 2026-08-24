@@ -1,0 +1,62 @@
+version: 2
+
+project_name: a10-certctl
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: a10-certctl
+    main: ./cmd/a10-certctl
+    binary: a10-certctl
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+      - -buildvcs=false
+    # GoReleaser expects Unix seconds here, not an RFC3339 timestamp.
+    # 946684800 = 2000-01-01T00:00:00Z.
+    mod_timestamp: "946684800"
+    ldflags:
+      - -s -w -X github.com/vpgc/a10-certctl/pkg/a10.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: a10-certctl
+    ids:
+      - a10-certctl
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- .Arch }}
+    files:
+      - README.md
+      - CHANGELOG.md
+      - PRODUCTION_READINESS.md
+      - docs/**
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  disable: true
+
+release:
+  name_template: "{{ .Tag }}"
