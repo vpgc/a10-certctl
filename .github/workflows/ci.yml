@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Format, vet, test, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check workflow action versions
+        shell: bash
+        run: bash ./scripts/check-workflow-actions.sh
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          files="$(gofmt -l $(find . -type f -name '*.go' -not -path './vendor/*'))"
+          test -z "$files" || { printf 'Files requiring gofmt:\n%s\n' "$files" >&2; exit 1; }
+
+      - name: Check module files
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Build CLI
+        run: go build -trimpath -buildvcs=false -ldflags="-s -w -X github.com/vpgc/a10-certctl/pkg/a10.version=ci" ./cmd/a10-certctl
+
+  govulncheck:
+    name: Scan Go vulnerabilities
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go for govulncheck
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.25.x"
+          check-latest: true
+          cache: true
+
+      - name: Show Go toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          go env GOTOOLCHAIN
+
+      - name: Run govulncheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
