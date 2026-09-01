@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -47,16 +48,17 @@ func TestLiveACOS6CreateManagedCertificateWithoutTemplate(t *testing.T) {
 			return
 		}
 		deleteErr := session.DeleteMaterial(cleanupContext, MaterialNames{Certificate: name, Key: KeyFileName(name)})
+		writeErr := session.WriteMemory(cleanupContext)
 		closeErr := session.Close(cleanupContext)
-		if err := errors.Join(deleteErr, closeErr); err != nil && !IsNotFound(err) {
+		if err := errors.Join(deleteErr, writeErr, closeErr); err != nil && !IsNotFound(err) {
 			t.Errorf("clean up unbound certificate material: %v", err)
 		}
 	}()
-	result, err := client.CreateManagedCertificate(ctx, bundle, CreateOptions{NamePrefix: prefix, NoWriteMemory: true})
+	result, err := client.CreateManagedCertificate(ctx, bundle, CreateOptions{NamePrefix: prefix})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Changed || !result.Uploaded || result.WroteMemory || result.Certificate.Name != name || result.Certificate.Target != (CertificateTarget{}) {
+	if !result.Changed || !result.Uploaded || !result.WroteMemory || result.RolledBack || result.Certificate.Name != name || result.Certificate.Target != (CertificateTarget{}) {
 		t.Fatalf("unexpected unbound create result: %#v", result)
 	}
 	session, err := client.StartSession(ctx)
@@ -73,6 +75,137 @@ func TestLiveACOS6CreateManagedCertificateWithoutTemplate(t *testing.T) {
 		t.Fatalf("pre-staged material missing: certs=%v keys=%v", certificateFiles, keyFiles)
 	}
 	t.Logf("pre-staged unbound ACOS certificate and key %q", name)
+}
+
+type failFirstWriteMemoryTransport struct {
+	base   http.RoundTripper
+	mutex  sync.Mutex
+	failed bool
+}
+
+func (transport *failFirstWriteMemoryTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	transport.mutex.Lock()
+	if !transport.failed && request.Method == http.MethodPost && strings.HasSuffix(request.URL.Path, "/write/memory") {
+		transport.failed = true
+		transport.mutex.Unlock()
+		_ = request.Body.Close()
+		return &http.Response{
+			StatusCode: http.StatusBadRequest,
+			Status:     "400 injected persistence failure",
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"response":{"err":{"code":1,"msg":"injected persistence failure","location":"memory"}}}`,
+			)),
+			Request: request,
+		}, nil
+	}
+	transport.mutex.Unlock()
+	return transport.base.RoundTrip(request)
+}
+
+func TestLiveACOS6CreateRollbackOnPersistenceFailure(t *testing.T) {
+	if os.Getenv("A10_LIVE_TEST") != "1" {
+		t.Skip("set A10_LIVE_TEST=1 to run the mutating, self-cleaning appliance test")
+	}
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	baseTransport.TLSClientConfig = &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: liveBool("A10_LIVE_INSECURE_SKIP_VERIFY"), //nolint:gosec -- explicit lab test option
+	}
+	transport := &failFirstWriteMemoryTransport{base: baseTransport}
+	client, err := New(Config{
+		Address: os.Getenv("A10_HOST"), Username: os.Getenv("A10_USERNAME"), Password: os.Getenv("A10_PASSWORD"),
+		Partition: os.Getenv("A10_PARTITION"), HTTPClient: &http.Client{Transport: transport, Timeout: 30 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	prefix := fmt.Sprintf("certctl-rollback-%d", time.Now().UnixNano())
+	leafPEM, keyPEM := newTestPEMPair(t, prefix+".example.invalid")
+	bundle, err := ParseCertificateBundle(CertificateBundleInput{CertificatePEM: leafPEM, PrivateKeyPEM: keyPEM})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name, _, err := managedNamesForPrefix(bundle, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, createErr := client.CreateManagedCertificate(ctx, bundle, CreateOptions{NamePrefix: prefix})
+	if createErr == nil || errors.Is(createErr, ErrAmbiguousState) {
+		t.Fatalf("expected injected persistence error after successful rollback, got %v", createErr)
+	}
+	if !result.RolledBack || result.Stage != SyncStageRolledBack || result.WroteMemory {
+		t.Fatalf("unexpected live rollback result: %#v", result)
+	}
+	verify, err := client.StartSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificates, certErr := verify.ListCertificateFiles(ctx)
+	keys, keyErr := verify.ListKeyFiles(ctx)
+	closeErr := verify.Close(ctx)
+	if err := errors.Join(certErr, keyErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if contains(certificates, name) || contains(keys, KeyFileName(name)) {
+		t.Fatalf("live rollback left certificate material %q: certs=%v keys=%v", name, certificates, keys)
+	}
+	t.Logf("verified compensating rollback of live unbound material %q", name)
+}
+
+func TestLiveACOS6EmptyPartitionsByNameAndID(t *testing.T) {
+	if os.Getenv("A10_LIVE_TEST") != "1" {
+		t.Skip("set A10_LIVE_TEST=1 to run the appliance integration tests")
+	}
+	baseConfig := Config{
+		Address: os.Getenv("A10_HOST"), Username: os.Getenv("A10_USERNAME"), Password: os.Getenv("A10_PASSWORD"),
+		InsecureSkipVerify: liveBool("A10_LIVE_INSECURE_SKIP_VERIFY"), Timeout: 30 * time.Second,
+	}
+	client, err := New(baseConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	session, err := client.StartSession(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partitions, listErr := session.ListPartitions(ctx)
+	sharedWriteErr := session.WriteMemory(ctx)
+	closeErr := session.Close(ctx)
+	if err := errors.Join(listErr, sharedWriteErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if len(partitions) < 2 {
+		t.Fatalf("expected the two test L3V partitions, got %#v", partitions)
+	}
+	for _, partition := range partitions {
+		for _, config := range []Config{
+			{Address: baseConfig.Address, Username: baseConfig.Username, Password: baseConfig.Password, Partition: partition.Name.String(), InsecureSkipVerify: true, Timeout: 30 * time.Second},
+			{Address: baseConfig.Address, Username: baseConfig.Username, Password: baseConfig.Password, PartitionID: partition.ID, InsecureSkipVerify: true, Timeout: 30 * time.Second},
+		} {
+			partitionClient, err := New(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			partitionSession, err := partitionClient.StartSession(ctx)
+			if err != nil {
+				t.Fatalf("select partition %#v: %v", partition, err)
+			}
+			certificates, certErr := partitionSession.ListCertificateFiles(ctx)
+			keys, keyErr := partitionSession.ListKeyFiles(ctx)
+			metadata, metadataErr := partitionSession.ListCertificates(ctx)
+			writeErr := partitionSession.WriteMemory(ctx)
+			closeErr := partitionSession.Close(ctx)
+			if err := errors.Join(certErr, keyErr, metadataErr, writeErr, closeErr); err != nil {
+				t.Fatalf("exercise partition %#v: %v", partition, err)
+			}
+			t.Logf("partition %q (ID %d): certificates=%d keys=%d metadata=%d", partition.Name, partition.ID, len(certificates), len(keys), len(metadata))
+		}
+	}
 }
 
 func TestLiveACOS6CertificateLifecycle(t *testing.T) {

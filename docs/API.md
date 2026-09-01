@@ -18,7 +18,8 @@ client, err := a10.New(a10.Config{
 | `Address` | yes | ACOS management hostname or URL; `/axapi/v3` is appended |
 | `Username` | yes | aXAPI account |
 | `Password` | yes | aXAPI password; excluded from JSON |
-| `Partition` | no | ACOS partition selected after authentication |
+| `Partition` | no | ACOS L3V partition selected by exact name or decimal ID |
+| `PartitionID` | no | strongly typed numeric L3V partition selector; mutually exclusive with `Partition` |
 | `Timeout` | no | HTTP timeout; default 30 seconds |
 | `TrustedCertificate` | no | management CA as PEM text or file path |
 | `InsecureSkipVerify` | no | lab-only TLS verification bypass |
@@ -58,6 +59,8 @@ target := a10.ForClientSSLTemplate("www-client-tls")
 | `KeyFileName` | ACOS key file store name, returned by `/file/ssl-key` and `certificate-list[].key` |
 | `CAFileName` | ACOS CA store name |
 | `VirtualServerName` | operator-defined SLB virtual-server name |
+| `PartitionName` | operator-defined `partition-name`, returned by `GET /partition` |
+| `PartitionID` | numeric `id` assigned by ACOS and returned by `GET /partition` |
 | `CertificateTarget.ClientSSLTemplate` | template containing the logical certificate slot |
 | `CertificateTarget.CurrentCertificate` | optional exact current entry for a multi-certificate template |
 | `TemplateRevision` | SHA-256 digest of normalized complete template JSON read from ACOS; not an ACOS database ID |
@@ -127,6 +130,7 @@ SyncCertificate(ctx, target, bundle, options) (SyncResult, error)
 | `Stage` | last verified lifecycle stage |
 | `Changed` | whether the desired pair differed |
 | `Uploaded`, `Bound`, `UnboundOld`, `WroteMemory` | performed actions |
+| `RolledBack` | a failed pre-persistence change was restored and verified |
 | `DeletedOld` | exact removed file names |
 | `PreviousBinding` | binding observed before the change |
 | `Certificate` | final secret-free managed names and checksums |
@@ -134,8 +138,12 @@ SyncCertificate(ctx, target, bundle, options) (SyncResult, error)
 
 ACOS changes running configuration immediately. The method uploads immutable
 material, binds the complete pair, reads it back, checks the template revision
-around destructive steps, optionally removes unreferenced files, and writes
-memory by default.
+around destructive steps, and writes memory by default. Destructive cleanup is
+performed only after the desired binding has first been persisted. If initial
+persistence fails, the method restores the verified baseline binding, removes
+only files uploaded by that invocation, verifies both operations, and persists
+the baseline. An incomplete compensating rollback returns `RollbackError` and
+`ErrAmbiguousState`.
 
 ### CreateManagedCertificate
 
@@ -149,8 +157,9 @@ Pre-stages checksum-versioned certificate, private-key, and optional chain
 files without requiring or touching a client-SSL template. `NamePrefix` is
 required because ACOS certificate resources are named files. Calls through one
 `Client`, or one shared `Session`, are mutex-serialized. `CreateResult` reports
-the generated material names, uploads, persistence, and final lifecycle stage;
-it intentionally contains no binding target.
+the generated material names, uploads, persistence, rollback, and final
+lifecycle stage; it intentionally contains no binding target. A failure after
+upload triggers verified deletion of only the material created by that call.
 
 A10 provides no editable per-certificate comment in either its certificate GUI
 workflow or its certificate-file and client-SSL binding APIs. The common
@@ -160,7 +169,11 @@ than silently discarding it.
 ## Low-level API
 
 `StartSession` returns `Session`, which exposes typed inventory, upload,
-binding, unbinding, deletion, VIP discovery, and `WriteMemory` calls. Operations
+partition inventory, binding, unbinding, deletion, VIP discovery, and
+`WriteMemory` calls. `WriteMemory` automatically uses `shared` or `specified`
+scope and the active partition name required by aXAPI. Empty certificate and
+virtual-server inventories returned as HTTP 204 are represented as empty
+slices. Operations
 outside the typed surface are available only through `Session.Raw().DoJSON`.
 
 ## Errors
@@ -174,5 +187,5 @@ Use `errors.Is` with:
 - `ErrAmbiguousState`
 
 Concrete errors such as `ConflictError`, `CompatibilityError`, `NotFoundError`,
-`AmbiguousStateError`, and `APIError` retain diagnostic fields for
+`AmbiguousStateError`, `RollbackError`, and `APIError` retain diagnostic fields for
 `errors.As`.

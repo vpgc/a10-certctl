@@ -41,8 +41,11 @@ func (s *Session) ListVirtualServers(ctx context.Context) ([]VirtualServer, erro
 	var document struct {
 		VirtualServers []VirtualServer `json:"virtual-server-list"`
 	}
-	if err := s.doJSON(ctx, http.MethodGet, "/slb/virtual-server", nil, &document, http.StatusOK); err != nil {
+	if err := s.doJSON(ctx, http.MethodGet, "/slb/virtual-server", nil, &document, http.StatusOK, http.StatusNoContent); err != nil {
 		return nil, err
+	}
+	if document.VirtualServers == nil {
+		return []VirtualServer{}, nil
 	}
 	return document.VirtualServers, nil
 }

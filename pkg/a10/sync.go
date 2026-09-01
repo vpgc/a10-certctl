@@ -67,10 +67,12 @@ type CreateOptions struct {
 
 // CreateResult reports pre-staged, deliberately unbound A10 material.
 type CreateResult struct {
-	Stage       SyncStage          `json:"stage"`
-	Changed     bool               `json:"changed"`
-	Uploaded    bool               `json:"uploaded"`
-	WroteMemory bool               `json:"wroteMemory"`
+	Stage       SyncStage `json:"stage"`
+	Changed     bool      `json:"changed"`
+	Uploaded    bool      `json:"uploaded"`
+	WroteMemory bool      `json:"wroteMemory"`
+	// RolledBack reports that newly uploaded material was removed after an error.
+	RolledBack  bool               `json:"rolledBack"`
 	Certificate ManagedCertificate `json:"certificate"`
 }
 
@@ -104,6 +106,7 @@ const (
 	SyncStageOldBindingRemoved     SyncStage = "old-binding-removed"
 	SyncStageCleanupComplete       SyncStage = "cleanup-complete"
 	SyncStagePersisted             SyncStage = "persisted"
+	SyncStageRolledBack            SyncStage = "rolled-back"
 	SyncStageComplete              SyncStage = "complete"
 )
 
@@ -123,6 +126,9 @@ type SyncResult struct {
 	DeletedOld []string `json:"deletedOld,omitempty"`
 	// WroteMemory reports final running-config persistence.
 	WroteMemory bool `json:"wroteMemory"`
+	// RolledBack reports that running state and newly uploaded files were
+	// restored after persistence failed.
+	RolledBack bool `json:"rolledBack"`
 	// PreviousBinding is the binding observed before synchronization.
 	PreviousBinding *CertificateBinding `json:"previousBinding,omitempty"`
 	// Certificate is the final secret-free managed state.
@@ -151,6 +157,34 @@ func (err *AmbiguousStateError) Error() string {
 
 func (err *AmbiguousStateError) Unwrap() error        { return err.Cause }
 func (err *AmbiguousStateError) Is(target error) bool { return target == ErrAmbiguousState }
+
+// RollbackError reports an operation failure followed by an incomplete
+// compensating rollback. ACOS does not expose a configuration transaction for
+// these resources, so callers must reconcile when this error is returned.
+type RollbackError struct {
+	Operation string
+	Cause     error
+	Rollback  error
+}
+
+func (err *RollbackError) Error() string {
+	return fmt.Sprintf("A10 %s failed (%v) and compensating rollback was incomplete: %v", err.Operation, err.Cause, err.Rollback)
+}
+
+func (err *RollbackError) Unwrap() []error { return []error{err.Cause, err.Rollback} }
+func (err *RollbackError) Is(target error) bool {
+	return target == ErrAmbiguousState
+}
+
+type uploadedMaterial struct {
+	certificate CertificateFileName
+	key         KeyFileName
+	chain       CertificateFileName
+}
+
+func (material uploadedMaterial) empty() bool {
+	return material.certificate == "" && material.key == "" && material.chain == ""
+}
 
 // SyncCertificate performs a checksum-versioned A10 rotation: upload the new
 // immutable pair, bind it, verify ACOS's resulting binding state, remove an old
@@ -202,10 +236,10 @@ func (c *Client) CreateManagedCertificate(ctx context.Context, bundle Certificat
 
 // CreateManagedCertificate uploads an unbound managed pair through this
 // session. Calls sharing the Session are serialized; reads remain concurrent.
-func (s *Session) CreateManagedCertificate(ctx context.Context, bundle CertificateBundle, options CreateOptions) (CreateResult, error) {
+func (s *Session) CreateManagedCertificate(ctx context.Context, bundle CertificateBundle, options CreateOptions) (result CreateResult, err error) {
 	s.managedMu.Lock()
 	defer s.managedMu.Unlock()
-	result := CreateResult{Stage: SyncStageStarted}
+	result = CreateResult{Stage: SyncStageStarted}
 	if err := bundle.validateForSync(time.Now()); err != nil {
 		return result, err
 	}
@@ -221,6 +255,27 @@ func (s *Session) CreateManagedCertificate(ctx context.Context, bundle Certifica
 		Name: name, ChainName: chainName, CertificateChecksum: bundle.Certificate.Checksum,
 		KeyChecksum: bundle.Key.Checksum, BundleChecksum: bundle.Checksum,
 	}
+	uploaded := uploadedMaterial{}
+	persistenceAttempted := false
+	defer func() {
+		if err == nil || uploaded.empty() {
+			return
+		}
+		rollbackContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if rollbackErr := s.rollbackUploadedMaterial(rollbackContext, uploaded); rollbackErr != nil {
+			err = &RollbackError{Operation: "create managed certificate", Cause: err, Rollback: rollbackErr}
+			return
+		}
+		if persistenceAttempted {
+			if rollbackErr := s.WriteMemory(rollbackContext); rollbackErr != nil {
+				err = &RollbackError{Operation: "create managed certificate", Cause: err, Rollback: fmt.Errorf("persist cleaned state: %w", rollbackErr)}
+				return
+			}
+		}
+		result.RolledBack = true
+		result.Stage = SyncStageRolledBack
+	}()
 	certificateFiles, err := s.ListCertificateFiles(ctx)
 	if err != nil {
 		return result, err
@@ -238,6 +293,7 @@ func (s *Session) CreateManagedCertificate(ctx context.Context, bundle Certifica
 			return result, fmt.Errorf("upload A10 private key %q: %w", name, err)
 		}
 		result.Uploaded, result.Changed = true, true
+		uploaded.key = KeyFileName(name)
 	}
 	if contains(certificateFiles, name) {
 		if err := verifyManagedCertificateCollision(certificates, name, bundle.Certificate); err != nil {
@@ -248,6 +304,7 @@ func (s *Session) CreateManagedCertificate(ctx context.Context, bundle Certifica
 			return result, fmt.Errorf("upload A10 certificate %q: %w", name, err)
 		}
 		result.Uploaded, result.Changed = true, true
+		uploaded.certificate = name
 	}
 	if chainName != "" {
 		if contains(certificateFiles, chainName) {
@@ -259,10 +316,12 @@ func (s *Session) CreateManagedCertificate(ctx context.Context, bundle Certifica
 				return result, fmt.Errorf("upload A10 certificate chain %q: %w", chainName, err)
 			}
 			result.Uploaded, result.Changed = true, true
+			uploaded.chain = chainName
 		}
 	}
 	result.Stage = SyncStageMaterialReady
 	if result.Changed && !options.NoWriteMemory {
+		persistenceAttempted = true
 		if err := s.WriteMemory(ctx); err != nil {
 			return result, fmt.Errorf("persist A10 pre-staged certificate material: %w", err)
 		}
@@ -287,10 +346,10 @@ func (s *Session) ReconcileCertificate(ctx context.Context, target CertificateTa
 }
 
 // SyncCertificate synchronizes through an existing session.
-func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget, bundle CertificateBundle, options SyncOptions) (SyncResult, error) {
+func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget, bundle CertificateBundle, options SyncOptions) (result SyncResult, err error) {
 	s.managedMu.Lock()
 	defer s.managedMu.Unlock()
-	result := SyncResult{Stage: SyncStageStarted}
+	result = SyncResult{Stage: SyncStageStarted}
 	if err := bundle.validateForSync(time.Now()); err != nil {
 		return result, err
 	}
@@ -338,6 +397,21 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		copyCurrent := *current
 		result.PreviousBinding = &copyCurrent
 	}
+	uploaded := uploadedMaterial{}
+	templateMutated := false
+	defer func() {
+		if err == nil || uploaded.empty() || templateMutated {
+			return
+		}
+		rollbackContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if rollbackErr := s.rollbackUploadedMaterial(rollbackContext, uploaded); rollbackErr != nil {
+			err = &RollbackError{Operation: "synchronize certificate material", Cause: err, Rollback: rollbackErr}
+			return
+		}
+		result.RolledBack = true
+		result.Stage = SyncStageRolledBack
+	}()
 
 	certificateFiles, err := s.ListCertificateFiles(ctx)
 	if err != nil {
@@ -357,6 +431,7 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		}
 		result.Uploaded = true
 		result.Changed = true
+		uploaded.key = desired.Key
 	}
 	if contains(certificateFiles, name) {
 		if err := verifyManagedCertificateCollision(certificates, name, bundle.Certificate); err != nil {
@@ -368,6 +443,7 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		}
 		result.Uploaded = true
 		result.Changed = true
+		uploaded.certificate = name
 	}
 	if chainName != "" && !contains(certificateFiles, chainName) {
 		if err := s.UploadChain(ctx, chainName, bundle.chainPEM(), UploadOptions{}); err != nil {
@@ -375,6 +451,7 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		}
 		result.Uploaded = true
 		result.Changed = true
+		uploaded.chain = chainName
 	} else if chainName != "" {
 		if err := verifyManagedCertificateCollision(certificates, chainName, bundle.Chain[0]); err != nil {
 			return result, err
@@ -396,6 +473,11 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		if current != nil && current.Certificate != desired.Certificate {
 			replacedTemplate = templateWithoutCertificate(appendedTemplate, current.Certificate)
 		}
+		// Once a binding request is sent, a lost/error response can still mean
+		// ACOS applied it. Do not delete possibly referenced files from the
+		// generic partial-upload rollback; the read-back logic below determines
+		// whether an explicit template rollback is safe.
+		templateMutated = true
 		bindErr := s.BindCertificate(ctx, target.ClientSSLTemplate, desired, bundle.Key.passphrase)
 		if bindErr == nil {
 			result.Bound = true
@@ -470,14 +552,6 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 		result.UnboundOld = true
 		result.Changed = true
 		result.Stage = SyncStageOldBindingRemoved
-		if options.CleanupOld {
-			deleted, err := s.deleteUnreferenced(ctx, *current, desired)
-			if err != nil {
-				return result, err
-			}
-			result.DeletedOld = deleted
-			result.Stage = SyncStageCleanupComplete
-		}
 	}
 
 	result.FinalRevision = expectedTemplate.Revision()
@@ -486,13 +560,115 @@ func (s *Session) SyncCertificate(ctx context.Context, target CertificateTarget,
 			return result, err
 		}
 		if err := s.WriteMemory(ctx); err != nil {
-			return result, fmt.Errorf("A10 running configuration changed but write memory failed: %w", err)
+			persistenceErr := fmt.Errorf("persist A10 certificate synchronization: %w", err)
+			rollbackContext, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			rollbackErr := s.rollbackSynchronization(rollbackContext, target, template, expectedTemplate, desired, uploaded)
+			cancel()
+			if rollbackErr != nil {
+				return result, &RollbackError{Operation: "certificate synchronization", Cause: persistenceErr, Rollback: rollbackErr}
+			}
+			result.RolledBack = true
+			result.Stage = SyncStageRolledBack
+			return result, persistenceErr
 		}
 		result.WroteMemory = true
 		result.Stage = SyncStagePersisted
 	}
+	// Destructive cleanup happens only after the desired binding has been
+	// persisted. This ensures a persistence failure can still restore the exact
+	// baseline because the previous material remains available.
+	if current != nil && current.Certificate != desired.Certificate && options.CleanupOld {
+		deleted, cleanupErr := s.deleteUnreferenced(ctx, *current, desired)
+		if cleanupErr != nil {
+			return result, cleanupErr
+		}
+		result.DeletedOld = deleted
+		result.Stage = SyncStageCleanupComplete
+		if len(deleted) != 0 && !options.NoWriteMemory {
+			if writeErr := s.WriteMemory(ctx); writeErr != nil {
+				return result, fmt.Errorf("persist A10 old-certificate cleanup: %w", writeErr)
+			}
+		}
+	}
 	result.Stage = SyncStageComplete
 	return result, nil
+}
+
+func (s *Session) rollbackSynchronization(ctx context.Context, target CertificateTarget, baseline, expected ClientSSLTemplate, desired CertificateBinding, uploaded uploadedMaterial) error {
+	current, err := s.GetClientSSLTemplate(ctx, target.ClientSSLTemplate)
+	if err != nil {
+		return fmt.Errorf("inspect template before rollback: %w", err)
+	}
+	if current.Revision() != expected.Revision() {
+		return fmt.Errorf("template changed before rollback (expected %s, got %s)", expected.Revision(), current.Revision())
+	}
+	baselineBinding, baselineHasDesired := findBinding(baseline.Certificates, desired.Certificate)
+	if !baselineHasDesired {
+		var previous *CertificateBinding
+		if len(baseline.Certificates) == 1 {
+			copyBinding := baseline.Certificates[0]
+			previous = &copyBinding
+		} else if target.CurrentCertificate != "" {
+			if found, ok := findBinding(baseline.Certificates, target.CurrentCertificate); ok {
+				previous = &found
+			}
+		}
+		if previous != nil && !hasBinding(current.Certificates, *previous) {
+			if err := s.BindCertificate(ctx, target.ClientSSLTemplate, *previous, nil); err != nil {
+				return fmt.Errorf("restore previous certificate binding: %w", err)
+			}
+			current, err = s.GetClientSSLTemplate(ctx, target.ClientSSLTemplate)
+			if err != nil {
+				return fmt.Errorf("verify restored certificate binding: %w", err)
+			}
+		}
+		if _, desiredPresent := findBinding(current.Certificates, desired.Certificate); desiredPresent {
+			if err := s.UnbindCertificate(ctx, target.ClientSSLTemplate, desired.Certificate); err != nil {
+				return fmt.Errorf("remove desired certificate binding during rollback: %w", err)
+			}
+		}
+	} else if !sameBinding(baselineBinding, desired) {
+		return errors.New("desired certificate name existed with different baseline binding")
+	}
+	verified, err := s.GetClientSSLTemplate(ctx, target.ClientSSLTemplate)
+	if err != nil {
+		return fmt.Errorf("verify template rollback: %w", err)
+	}
+	if verified.Revision() != baseline.Revision() {
+		return fmt.Errorf("template rollback verification failed (expected %s, got %s)", baseline.Revision(), verified.Revision())
+	}
+	if err := s.rollbackUploadedMaterial(ctx, uploaded); err != nil {
+		return err
+	}
+	if err := s.WriteMemory(ctx); err != nil {
+		return fmt.Errorf("persist restored baseline: %w", err)
+	}
+	return nil
+}
+
+func (s *Session) rollbackUploadedMaterial(ctx context.Context, uploaded uploadedMaterial) error {
+	if uploaded.certificate != "" || uploaded.key != "" {
+		if err := s.DeleteMaterial(ctx, MaterialNames{Certificate: uploaded.certificate, Key: uploaded.key}); err != nil {
+			return fmt.Errorf("delete newly uploaded certificate material: %w", err)
+		}
+	}
+	if uploaded.chain != "" {
+		if err := s.DeleteMaterial(ctx, MaterialNames{Certificate: uploaded.chain}); err != nil {
+			return fmt.Errorf("delete newly uploaded certificate chain: %w", err)
+		}
+	}
+	certificates, err := s.ListCertificateFiles(ctx)
+	if err != nil {
+		return fmt.Errorf("verify certificate rollback: %w", err)
+	}
+	keys, err := s.ListKeyFiles(ctx)
+	if err != nil {
+		return fmt.Errorf("verify private-key rollback: %w", err)
+	}
+	if contains(certificates, uploaded.certificate) || contains(certificates, uploaded.chain) || contains(keys, uploaded.key) {
+		return errors.New("newly uploaded A10 material remained after rollback")
+	}
+	return nil
 }
 
 func validateTarget(target CertificateTarget) error {

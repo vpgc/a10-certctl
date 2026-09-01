@@ -105,9 +105,10 @@ fmt.Printf("changed=%t name=%s bundle=%s\n",
 6. uploads a non-exportable key, certificate, and optional CA-chain file;
 7. binds and reads back the new pair, accepting either ACOS's atomic sole-pair
    replacement or an additional certificate-list entry before explicit old removal;
-8. optionally deletes old files only when their exact names do not occur in
-   any complete client-SSL or server-SSL response, including unknown 6.x fields;
-9. writes the final running configuration to memory; and
+8. writes the desired running configuration to the active partition's memory;
+9. optionally deletes old files only after persistence and only when their
+   exact names do not occur in any complete client-SSL or server-SSL response,
+   including unknown 6.x fields; and
 10. logs off on both success and error paths.
 
 ACOS applies running-configuration changes immediately. The versioned-pair sequence and single
@@ -116,6 +117,14 @@ leave a mismatched pair. ACOS may replace a sole binding as part of the
 successful bind request; on multi-entry templates the library verifies the added
 pair before explicitly removing the selected old binding. Old files remain
 available by default in either case.
+
+If persistence fails before old-file cleanup, the high-level workflow performs
+a compensating rollback: it restores and verifies the baseline binding,
+deletes and verifies only material uploaded by that call, and persists the
+restored baseline. `RolledBack` reports a successful compensation. An
+incomplete compensation returns `RollbackError`, categorized as
+`ErrAmbiguousState`. ACOS does not expose a native transaction for these
+endpoints, so this guarantee does not replace single-writer coordination.
 
 For a client-SSL template with multiple `certificate-list` entries, select the
 exact entry:
@@ -191,7 +200,9 @@ state is present, synchronization continues; if the original revision is still
 present, the error is safely retryable. Any third state returns a typed
 `AmbiguousStateError`, detectable with `errors.Is(err, a10.ErrAmbiguousState)`.
 `ReconcileCertificate` reuses the idempotent convergence workflow after
-operator review. Automatic blind rollback is deliberately avoided.
+operator review. Rollback is attempted only when the observed template is the
+exact state produced by the current invocation; it never overwrites a third,
+concurrent state.
 
 ## Build and test
 
@@ -200,9 +211,13 @@ go build ./cmd/a10-certctl
 go test ./...
 ```
 
-The live tests create a temporary, unbound client-SSL template, exercise a real
-upload and binding, verify it, remove all temporary objects, and run concurrent
-read sessions. They do not write the temporary state to memory.
+The live tests create temporary material and a client-SSL template, exercise
+real upload, binding, partition-scoped persistence, read-back and cleanup, and
+run concurrent read sessions. They also verify empty L3V partitions by both
+name and numeric ID. Temporary persisted material is deleted and that cleanup
+is written to memory. A transport-level failure injection additionally proves
+on the live appliance that unbound uploads are removed and the cleaned state is
+persisted after a failed initial write-memory response.
 
 ```bash
 export A10_LIVE_TEST=1
@@ -212,6 +227,7 @@ export A10_PASSWORD='...'
 export A10_LIVE_INSECURE_SKIP_VERIFY=1 # lab only
 export A10_TEST_VIP=10.0.0.20          # optional data-plane validation
 export A10_TEST_VIP_INSECURE_SKIP_VERIFY=1 # lab only
+export A10_PARTITION=partition-name        # optional name or numeric ID
 go test ./pkg/a10 -run '^TestLiveACOS6' -v
 ```
 
@@ -364,6 +380,7 @@ include SAN values in this response, so SAN-only discovery is not claimed.
 - `POST /auth`
 - `POST /logoff`
 - `POST /active-partition`
+- `GET /partition`
 - `GET /version/oper`
 - `GET /file/ssl-cert/oper`
 - `GET /file/ssl-key/oper`
@@ -391,6 +408,10 @@ aXAPI resources.
 - Tested appliance: A10 vThunder, ACOS 6.0.9 build 116, aXAPI 3.0.
 - ACOS running configuration changes are immediate; `write memory` controls
   persistence across reboot, not activation.
+- Empty certificate-related and virtual-server inventories may return HTTP
+  204; typed list calls normalize that response to an empty result.
+- `Config.Partition` and CLI `--partition` accept an exact name or decimal ID;
+  `Config.PartitionID` provides a strongly typed library selector.
 - The tested ACOS 6.0.9 endpoints expose no appliance transaction or
   conditional-write revision for the certificate/template endpoints.
   `TemplateRevision` is an optimistic

@@ -468,7 +468,7 @@ func parseGlobals(args []string, stderr io.Writer) (globalOptions, string, []str
 	fs.StringVar(&options.host, "host", options.host, "A10 management host or URL; env A10_HOST")
 	fs.StringVar(&options.username, "username", options.username, "A10 username; env A10_USERNAME")
 	fs.StringVar(&options.password, "password", options.password, "A10 password; env A10_PASSWORD")
-	fs.StringVar(&options.partition, "partition", options.partition, "optional ACOS partition; env A10_PARTITION")
+	fs.StringVar(&options.partition, "partition", options.partition, "optional ACOS partition name or numeric ID; env A10_PARTITION")
 	fs.BoolVar(&options.insecure, "insecure-skip-verify", options.insecure, "disable management TLS verification")
 	fs.BoolVar(&options.allowInsecureHTTP, "allow-insecure-http", options.allowInsecureHTTP, "allow unencrypted HTTP management traffic")
 	fs.StringVar(&options.trustedCertificate, "trusted-certificate", options.trustedCertificate, "management CA PEM file; env A10_TRUSTED_CERTIFICATE")

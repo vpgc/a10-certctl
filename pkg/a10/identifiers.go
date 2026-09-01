@@ -27,12 +27,44 @@ type KeyFileName string
 // store.
 type CAFileName string
 
+// PartitionName is the operator-defined name of an ACOS L3V partition.
+type PartitionName string
+
+// PartitionID is the numeric identifier ACOS assigns to an L3V partition.
+// Zero means that no partition ID was selected.
+type PartitionID uint32
+
+// Partition identifies an ACOS L3V partition by both representations returned
+// by aXAPI. Name is used with the active-partition and write-memory endpoints.
+type Partition struct {
+	Name PartitionName `json:"partition-name"`
+	ID   PartitionID   `json:"id"`
+}
+
 func (name ClientSSLTemplateName) String() string { return string(name) }
 func (name ServerSSLTemplateName) String() string { return string(name) }
 func (name VirtualServerName) String() string     { return string(name) }
 func (name CertificateFileName) String() string   { return string(name) }
 func (name KeyFileName) String() string           { return string(name) }
 func (name CAFileName) String() string            { return string(name) }
+func (name PartitionName) String() string         { return string(name) }
+func (id PartitionID) String() string             { return fmt.Sprintf("%d", id) }
+
+// ParsePartitionName validates and returns an ACOS L3V partition name.
+func ParsePartitionName(value string) (PartitionName, error) {
+	if err := validateObjectName("partition", value); err != nil {
+		return "", err
+	}
+	return PartitionName(value), nil
+}
+
+// ParsePartitionID validates and returns an ACOS L3V partition ID.
+func ParsePartitionID(value uint64) (PartitionID, error) {
+	if value == 0 || value > uint64(^PartitionID(0)) {
+		return 0, fmt.Errorf("A10 partition ID %d is outside the supported range", value)
+	}
+	return PartitionID(value), nil
+}
 
 // ParseClientSSLTemplateName validates and returns a client-SSL template name.
 func ParseClientSSLTemplateName(value string) (ClientSSLTemplateName, error) {

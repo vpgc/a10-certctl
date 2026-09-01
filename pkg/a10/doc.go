@@ -16,11 +16,12 @@
 // running configuration to memory.
 //
 // The supported contract is ACOS 6.x.y; patch and build versions are not
-// pinned. The tested ACOS 6.0.9 endpoints do not expose a transaction or
-// conditional-write primitive for these resources. TemplateRevision and
-// ConflictError provide fail-closed conflict detection, but deployments with
-// multiple configuration owners must additionally coordinate ownership
-// outside the appliance.
+// pinned. The tested ACOS 6.0.9 endpoints do not expose a native transaction or
+// conditional-write primitive for these resources. High-level methods perform
+// verified compensating rollback before destructive cleanup; TemplateRevision
+// and ConflictError provide fail-closed conflict detection. Deployments with
+// multiple configuration owners must still coordinate ownership outside the
+// appliance.
 //
 // The package's primary flow is New, ParseCertificateBundle,
 // ForClientSSLTemplate, GetManagedCertificateState, and SyncCertificate. All input

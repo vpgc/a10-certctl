@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.0.2
+
+### Fixed
+
+- Accept ACOS HTTP 204 as an empty certificate, key, CA, operational
+  certificate, client-SSL-template, or virtual-server inventory so management
+  and VIP discovery work in empty L3V partitions.
+- Send the required `destination`, `partition`, and `specified-partition`
+  fields to `/write/memory`; persistence now succeeds in shared and L3V
+  partitions instead of returning HTTP 400.
+- Resolve L3V partitions by exact name or ACOS numeric ID and expose typed
+  `PartitionName`, `PartitionID`, `Partition`, `ListPartitions`, and
+  `ActivePartition` APIs.
+- Add verified compensating cleanup for partial high-level uploads and restore
+  the baseline template/material after pre-cleanup persistence failures.
+  Incomplete rollback is explicitly reported as `RollbackError` and
+  `ErrAmbiguousState`.
+- Persist the desired certificate binding before opt-in deletion of previous
+  material, then persist the cleanup separately.
+
+### Changed
+
+- Raise the module baseline to Go 1.27 and `golang.org/x/crypto` v0.52.0.
+- Extend unit and live-appliance coverage for empty inventories, partition
+  name/ID selection, write-memory JSON, persisted unbound creation, and
+  verified rollback after an injected persistence failure.
+
 ## v0.0.1
 
 ### Added

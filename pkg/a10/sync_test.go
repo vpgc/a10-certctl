@@ -141,10 +141,11 @@ func TestSyncCertificateUploadsBindsVerifiesCleansAndWritesMemory(t *testing.T) 
 		"GET /axapi/v3/slb/template/client-ssl/TLS_TEMPLATE",
 		"DELETE /axapi/v3/slb/template/client-ssl/TLS_TEMPLATE/certificate/old-cert",
 		"GET /axapi/v3/slb/template/client-ssl/TLS_TEMPLATE",
+		"GET /axapi/v3/slb/template/client-ssl/TLS_TEMPLATE",
+		"POST /axapi/v3/write/memory",
 		"GET /axapi/v3/slb/template/client-ssl",
 		"GET /axapi/v3/slb/template/server-ssl",
 		"POST /axapi/v3/pki/delete",
-		"GET /axapi/v3/slb/template/client-ssl/TLS_TEMPLATE",
 		"POST /axapi/v3/write/memory",
 		"POST /axapi/v3/logoff",
 	}

@@ -334,7 +334,11 @@ type deleteMaterialDocument struct {
 }
 
 type writeMemoryDocument struct {
-	Memory struct{} `json:"memory"`
+	Memory struct {
+		Destination        string        `json:"destination"`
+		Partition          string        `json:"partition"`
+		SpecifiedPartition PartitionName `json:"specified-partition,omitempty"`
+	} `json:"memory"`
 }
 
 // ACOSVersion returns appliance and aXAPI version information without being
@@ -359,7 +363,10 @@ func (s *Session) ListCertificates(ctx context.Context) ([]CertificateInfo, erro
 			} `json:"oper"`
 		} `json:"ssl-cert"`
 	}
-	err := s.doJSON(ctx, http.MethodGet, "/slb/ssl-cert/oper", nil, &document, http.StatusOK)
+	err := s.doJSON(ctx, http.MethodGet, "/slb/ssl-cert/oper", nil, &document, http.StatusOK, http.StatusNoContent)
+	if err == nil && document.Certificate.Operational.Certificates == nil {
+		return []CertificateInfo{}, nil
+	}
 	return document.Certificate.Operational.Certificates, err
 }
 
@@ -450,7 +457,7 @@ func (s *Session) listFiles(ctx context.Context, endpoint, root string) ([]strin
 		Keys         *fileListResource `json:"ssl-key"`
 		CAs          *fileListResource `json:"ca-cert"`
 	}
-	if err := s.doJSON(ctx, http.MethodGet, endpoint, nil, &document, http.StatusOK); err != nil {
+	if err := s.doJSON(ctx, http.MethodGet, endpoint, nil, &document, http.StatusOK, http.StatusNoContent); err != nil {
 		return nil, err
 	}
 	var resource *fileListResource
@@ -465,7 +472,7 @@ func (s *Session) listFiles(ctx context.Context, endpoint, root string) ([]strin
 		return nil, fmt.Errorf("aXAPI response did not contain %q", root)
 	}
 	if resource == nil {
-		return nil, fmt.Errorf("aXAPI response did not contain %q", root)
+		return []string{}, nil
 	}
 	result := make([]string, 0, len(resource.Operational.Files))
 	for _, item := range resource.Operational.Files {
@@ -481,7 +488,10 @@ func (s *Session) ListClientSSLTemplates(ctx context.Context) ([]ClientSSLTempla
 	var document struct {
 		Templates []ClientSSLTemplate `json:"client-ssl-list"`
 	}
-	err := s.doJSON(ctx, http.MethodGet, "/slb/template/client-ssl", nil, &document, http.StatusOK)
+	err := s.doJSON(ctx, http.MethodGet, "/slb/template/client-ssl", nil, &document, http.StatusOK, http.StatusNoContent)
+	if err == nil && document.Templates == nil {
+		return []ClientSSLTemplate{}, nil
+	}
 	return document.Templates, err
 }
 
@@ -511,6 +521,9 @@ func (s *Session) ListServerSSLTemplates(ctx context.Context) ([]ServerSSLTempla
 		Templates []ServerSSLTemplate `json:"server-ssl-list"`
 	}
 	err := s.doJSON(ctx, http.MethodGet, "/slb/template/server-ssl", nil, &document, http.StatusOK, http.StatusNoContent)
+	if err == nil && document.Templates == nil {
+		return []ServerSSLTemplate{}, nil
+	}
 	return document.Templates, err
 }
 
@@ -673,7 +686,15 @@ func (s *Session) DeleteMaterial(ctx context.Context, names MaterialNames) error
 
 // WriteMemory persists the running ACOS configuration.
 func (s *Session) WriteMemory(ctx context.Context) error {
-	return s.doJSON(ctx, http.MethodPost, "/write/memory", writeMemoryDocument{}, nil, http.StatusOK, http.StatusCreated, http.StatusNoContent)
+	body := writeMemoryDocument{}
+	body.Memory.Destination = "primary"
+	if s.partition.Name == "" {
+		body.Memory.Partition = "shared"
+	} else {
+		body.Memory.Partition = "specified"
+		body.Memory.SpecifiedPartition = s.partition.Name
+	}
+	return s.doJSON(ctx, http.MethodPost, "/write/memory", body, nil, http.StatusOK, http.StatusCreated, http.StatusNoContent)
 }
 
 func validateFileName(name string) error {

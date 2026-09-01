@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,8 +35,13 @@ type Config struct {
 	Username string `json:"username"`
 	// Password is the aXAPI password and is excluded from JSON.
 	Password string `json:"-"`
-	// Partition selects an optional ACOS partition after login.
+	// Partition selects an optional ACOS partition by exact name or decimal ID.
+	// Use PartitionID for a strongly typed numeric selector. Numeric strings are
+	// interpreted as IDs; use PartitionID to avoid ambiguity in new code.
 	Partition string `json:"partition,omitempty"`
+	// PartitionID selects an optional ACOS partition by numeric ID. It cannot be
+	// combined with Partition.
+	PartitionID PartitionID `json:"partitionId,omitempty"`
 	// Timeout limits a complete HTTP request; zero uses 30 seconds.
 	Timeout time.Duration `json:"timeout,omitempty"`
 	// InsecureSkipVerify disables management TLS verification for labs.
@@ -53,13 +59,14 @@ type Config struct {
 // Client is an authenticated-session factory. It is safe for concurrent use;
 // each operation can create an independent aXAPI signature with StartSession.
 type Client struct {
-	baseURL   *url.URL
-	username  string
-	password  string
-	partition string
-	http      *http.Client
-	userAgent string
-	managedMu sync.Mutex
+	baseURL     *url.URL
+	username    string
+	password    string
+	partition   string
+	partitionID PartitionID
+	http        *http.Client
+	userAgent   string
+	managedMu   sync.Mutex
 }
 
 // New creates an ACOS aXAPI client from Config.
@@ -69,6 +76,9 @@ func New(config Config) (*Client, error) {
 	}
 	if config.Password == "" {
 		return nil, errors.New("missing A10 password")
+	}
+	if strings.TrimSpace(config.Partition) != "" && config.PartitionID != 0 {
+		return nil, errors.New("A10 partition name/selector and partition ID cannot be combined")
 	}
 	baseURL, err := configuredAddress(config.Address, config.AllowInsecureHTTP || config.HTTPClient != nil)
 	if err != nil {
@@ -83,12 +93,13 @@ func New(config Config) (*Client, error) {
 		userAgent = defaultUserAgent()
 	}
 	return &Client{
-		baseURL:   baseURL,
-		username:  config.Username,
-		password:  config.Password,
-		partition: strings.TrimSpace(config.Partition),
-		http:      httpClient,
-		userAgent: userAgent,
+		baseURL:     baseURL,
+		username:    config.Username,
+		password:    config.Password,
+		partition:   strings.TrimSpace(config.Partition),
+		partitionID: config.PartitionID,
+		http:        httpClient,
+		userAgent:   userAgent,
 	}, nil
 }
 
@@ -185,6 +196,7 @@ type Session struct {
 	lifecycle sync.RWMutex
 	managedMu sync.Mutex
 	closed    bool
+	partition Partition
 }
 
 type authRequest struct {
@@ -222,15 +234,71 @@ func (c *Client) StartSession(ctx context.Context) (*Session, error) {
 		return nil, errors.New("A10 authentication response did not contain a signature")
 	}
 	session := &Session{client: c, token: response.AuthResponse.Signature}
-	if c.partition != "" {
+	selected, err := session.resolvePartition(ctx, c.partition, c.partitionID)
+	if err != nil {
+		_ = session.Close(context.Background())
+		return nil, err
+	}
+	if selected.Name != "" {
 		body := activePartitionDocument{}
-		body.Partition.Name = c.partition
+		body.Partition.Name = selected.Name.String()
 		if err := session.doJSON(ctx, http.MethodPost, "/active-partition", body, nil, http.StatusOK, http.StatusCreated, http.StatusNoContent); err != nil {
 			_ = session.Close(context.Background())
-			return nil, fmt.Errorf("select A10 partition %q: %w", c.partition, err)
+			return nil, fmt.Errorf("select A10 partition %q: %w", selected.Name, err)
 		}
+		session.partition = selected
 	}
 	return session, nil
+}
+
+// ActivePartition returns the selected L3V partition. The zero value denotes
+// the shared partition. ID can be zero when selection was made by name without
+// requiring an inventory lookup.
+func (s *Session) ActivePartition() Partition { return s.partition }
+
+// ListPartitions returns the available ACOS L3V partitions.
+func (s *Session) ListPartitions(ctx context.Context) ([]Partition, error) {
+	var document struct {
+		Partitions []Partition `json:"partition-list"`
+	}
+	if err := s.doJSON(ctx, http.MethodGet, "/partition", nil, &document, http.StatusOK, http.StatusNoContent); err != nil {
+		return nil, err
+	}
+	if document.Partitions == nil {
+		return []Partition{}, nil
+	}
+	return document.Partitions, nil
+}
+
+func (s *Session) resolvePartition(ctx context.Context, selector string, id PartitionID) (Partition, error) {
+	if id == 0 && selector == "" {
+		return Partition{}, nil
+	}
+	if id == 0 {
+		if numeric, err := strconv.ParseUint(selector, 10, 32); err == nil {
+			parsed, parseErr := ParsePartitionID(numeric)
+			if parseErr != nil {
+				return Partition{}, parseErr
+			}
+			id = parsed
+		} else {
+			name, nameErr := ParsePartitionName(selector)
+			if nameErr != nil {
+				return Partition{}, nameErr
+			}
+			return Partition{Name: name}, nil
+		}
+	}
+	partitions, err := s.ListPartitions(ctx)
+	if err != nil {
+		return Partition{}, fmt.Errorf("resolve A10 partition ID %d: %w", id, err)
+	}
+	for _, partition := range partitions {
+		if partition.ID == id {
+			return partition, nil
+		}
+	}
+	return Partition{}, &NotFoundError{Kind: "partition", Name: id.String()}
 }
 
 // Close invalidates the aXAPI signature. It is safe to call more than once.
